@@ -1,0 +1,618 @@
+---
+title: "Data Visualization 2: Project"
+subtitle: "Coffee ratings"
+author: "Viktória Kónya"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+geometry: margin=2cm
+fontsize: 9pt
+header-includes:
+   - \usepackage{animate}
+output:
+
+  prettydoc::html_pretty:
+    highlight: github
+    toc: true
+    theme: cayman
+---
+
+```{r setup, include = F}
+
+knitr::opts_chunk$set(warning = F, message = F)
+
+```
+
+The report is also available on RPubs.
+
+### Introduction
+
+In this report I am going to analyze the Coffee Ratings dataset which was released on the 28th week of 2020 on [Tidy Tuesday' GitHub page](https://github.com/rfordatascience/tidytuesday/blob/master/data/2020/2020-07-07/readme.md). The data set contains information about both Arabica and Robusta beans across many countries and professionally rated on a 0-100 scale. Many sorts of scoring are available for each producer such as based on the acidity, sweetness, fragrance and the balance of the coffee which can provide interesting insights o the differences between coffee producing countries. In this analysis I will focus on country level analysis of the coffee ratings and the different dimensions of assessment of the coffee quality as well as its relationship with the growing altitude. With the help of descriptive analytics and data visualization I will try to find answer for the following question: where should I travel if I want to drink the best coffee in the world?
+
+### The dataset
+
+We can import the coffee ratings data set using the **tidytuesdayR** package. The dataset was converted to a data.table object in order to make the subsequent data cleaning and feature engineering more efficient.
+
+```{r data_import}
+
+# Clear environment
+rm(list=ls())
+
+# Import libraries for data management
+library(tidytuesdayR)
+library(data.table)
+library(ggplot2)
+library(ggrepel)
+library(sf)
+library(tidyverse)
+library(kableExtra)
+
+# Import dataset
+df <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-07-07/coffee_ratings.csv')
+
+# Convert to data table
+df <- data.table(df)
+
+```
+
+Let's take a quick look at the imported dataset.
+
+```{r dataset_skim}
+
+str(df)
+
+```
+
+As the dataset was collected with web scraping there are obviously lots of fields that are out of our interest. Let's get rid of them first.
+
+```{r drop_fields}
+
+# Drop unnecessary fields
+drops <- c("lot_number", "ico_number",  "certification_body", "certification_address", "certification_contact",  "altitude", "mill", "farm_name", "company_name",  "bag_weight", "altitude_low_meters", "altitude_high_meters", "in_country_partner", "unit_of_measurement", "owner_1", "number_of_bags", "category_one_defects", "quakers", "expiration", "category_two_defects", "harvest_year", "company", "producer")
+
+df <- df[, (drops) := NULL]
+
+rm(drops)
+
+```
+
+Identifiers and different certificate numbers can be dropped. As the measure of the altitude we are going to use the altitude_mean_meters which is the mean of the higher and lower altitude limits and already converted to meters. We are not going to drill down to producer or farm level so these fields can be also removed. Also the number of coffee bags used for the testing is not relevant for us so we will remove it.
+
+### Technical preparation
+
+In order to unify the outlook of our graps I created a custom theme in advance that we are going to add to each graph.
+
+```{r custom_theme}
+
+source("theme_viki.R")
+
+```
+
+Also for the explanatory data analysis custom graph functions were created in advance.
+
+```{r helper_grph_functions}
+
+# Histogram
+histograms <- function( data, x_var , x_lab, bin ){
+  # n = nrow(df)
+  
+  ggplot( data , aes(x = x_var)) +
+    geom_histogram( aes(y = (..count..)/sum(..count..)), binwidth = bin, fill="#238b45", color = 'gray50', alpha = 0.8, na.rm = T) +
+    # stat_function(fun = function(x) dnorm(x, mean = mean(x_var, na.rm = T), sd = sd(x_var, na.rm = T)) * n * bin, color = "darkred", size = 1, na.rm = T) +
+    labs(y = 'Percent',x = x_lab ) +
+    scale_y_continuous(labels = scales::percent_format(1)) +
+    theme_viki()
+}
+
+# Boxplot
+boxplots <- function( data, x_var , y_var, x_lab , y_lab ){
+  
+  ggplot(data, aes(x = factor(x_var), y = y_var)) +
+    geom_boxplot( fill="#238b45", alpha = 0.8) +
+    stat_boxplot(geom = "errorbar", width = 0.8, size = 0.3, na.rm=T) +
+    labs(y = y_lab,x = x_lab ) +
+    theme_viki()
+}
+
+```
+
+### Data cleaning
+
+Now we can start to explore and clean our dataset. First let's take a look at the numeric variables.
+
+```{r data_summary_numeric}
+
+# Import library
+library(modelsummary)
+
+# Summary table 
+datasummary_skim(df, 'numeric') 
+
+```
+
+Our main field of interest is the **total_cup_points** which is the total rating of the coffee and is measured in a 0 to 100 scale. Other 11 individual coffee quality grade measures are also available which are the following: aroma, flavor, aftertaste, acidity, body, balance, uniformity, clean_cup, sweetness, cupper_points, moisture. There are no missings and the range seems fine, so no additional cleaning step is needed for these fields. With the altitude, on the other hand, it seems that there are some data issues. First of all it has extreme values above 190 thousand meters which is higher than the peak of the Mount Everest (8848 meters). Even if we remove these observations from the edge of the distribution, there seems to remain some observations with higher than 6000 meters of growing altitude. If we check some external statistics about coffee producing, it seems that growing altitude above 3000 meters is not likely, hence we I will exclude observations with mean altitude above 3000 meters from the analysis.
+
+![coffee_altitude](C:/Users/User/Documents/GitHub/CEU-DV2/Assignments/A3/output/coffee_altitude.jpg) The next step is to take a look at the categorical fields.
+
+```{r data_summary_categorical}
+
+# Summary table
+datasummary_skim(df, 'categorical')
+
+```
+
+97.9% of the coffee sample tested was Arabica. Regarding the country of origin, it is important to convert them to standard names that we can later use for the geocoding. I will also introduce a new categorization for the continent. There is one record with missing country which I will remove from the dataset. In case of the variety of the beans, there are a lot of small categories with only a few observations which will be grouped together to a separate 'Other' category. Finally, the grading date is in date format. For the later visualizations I will extract the year using the **lubridate** package.
+
+```{r data_cleaning }
+
+# Import library
+library(lubridate)
+
+# Create unique ID
+df$ID <- seq_along(df[[1]])
+
+# Correct country names
+df[, country_of_origin := ifelse(country_of_origin == 'Cote d?Ivoire', "Ivory Coast", country_of_origin)]
+df[, country_of_origin := ifelse(country_of_origin == 'Tanzania, United Republic Of', "Tanzania", country_of_origin)]
+df[, country_of_origin := ifelse(country_of_origin == 'United States (Puerto Rico)', "Puerto Rico", country_of_origin)]
+df[, country_of_origin := ifelse(country_of_origin == 'United States (Hawaii)', "Hawaii", country_of_origin)]
+df[, country_of_origin := ifelse(country_of_origin == 'United States', "USA", country_of_origin)]
+
+# Add continent
+africa <- c("Ethiopia","Guatemala","Uganda","Kenya","Tanzania","Burundi","Rwanda","Malawi","Zambia","Mauritius","Ivory Coast")
+north_america <- c("USA","Hawaii","Puerto Rico")
+south_and_central_america <- c("Costa Rica","Mexico","Brazil","Honduras","Colombia","Panama","El Salvador","Nicaragua","Ecuador","Haiti","Peru")
+asia <- c("Indonesia","China","Taiwan","Thailand","Papua New Guinea","Japan","Vietnam","Philippines","Laos","Myanmar","India")
+
+df[, continent_of_origin := fcase(
+      country_of_origin %in% africa, 'Africa',
+      country_of_origin %in% north_america, 'North America',
+      country_of_origin %in% south_and_central_america, 'South and Central America',      
+      country_of_origin %in% asia, 'Asia')]
+
+# Put small varierty categories (with below 10 observations) to 'Other'
+variety_group <- df[!is.na(variety), .(count = .N), by = .(variety)][count < 10]
+df[, variety_grouped := ifelse(variety %in% variety_group$variety, 'Other', variety)]
+
+# Drop observations with missing data
+df <- df[!is.na(country_of_origin)] # 1 obs.
+df <- df[total_cup_points != 0] # 1 obs.
+
+# Extract year from grading date
+df[, grading_date_year := year(mdy(grading_date))]
+
+# Exclude observations with 3000+ meters altitude
+df <- df[altitude_mean_meters < 3000]
+
+# Metric list
+rating_metrics <- c("aroma", "flavor", "aftertaste","acidity", "body", "balance", "uniformity",  "clean_cup", "sweetness", "cupper_points", "moisture")
+  
+rm(variety_group, africa, north_america, south_and_central_america, asia)
+
+```
+
+### Explanatory data analysis
+
+Before we start to create analyze the coffee ratings, let's take a look at the distributions of our variables of interest.
+
+```{r eda_numerical}
+
+# Histograms
+histograms(df, df$total_cup_points, "Total cup pionts", 1) +
+  annotate("text", x = 61, y = 0.015, label = "Guatemala")
+histograms(df, df$altitude_mean_meters, "Mean altitude (meters)", 100)
+
+```
+
+In case of the total coffee ratings, there are 7 observations on the left edge of the distributions which have below 70 score. Regarding the altitude there seems to be some coffee farms where the growing altitude is below 100 meters above the sea level. These vast majority of these farms are located in Brazil so we cannot exclude that there are farms at such low altitude, hence I kept these observations in the dataset.
+
+Let's also compare the distributions of the different coffee rating metrics. For this, I will use the **ggridges** package which enables us to create nice ridgeline plots.
+
+```{r eda3, fig.align='center', fig.height=8, fig.width=6}
+
+# Import library
+library(ggridges)
+
+# Create long dataset
+df_long <- melt(df[, .SD, .SDcols =  c("ID", rating_metrics)], id.vars = "ID",
+                measure.vars = rating_metrics)
+
+ggplot( df_long, aes(y = variable, x = value, fill = variable, color = "gray10") ) +
+  geom_density_ridges(scale = 1.5, alpha = 0.8, show.legend = F) +
+  labs(title = 'Distributions of coffee rating metrics') +
+  scale_fill_viridis_d() +
+  scale_color_viridis_d() +
+  theme_viki() +
+    theme(
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank())
+
+rm(df_long)
+
+```
+
+The distributions of the coffee quality metrics can be separated into three groups: those centered around 7.5, those with very high ratings around 10 and the moisture of the coffee which has a distribution with the lowest values.
+
+If we check the correlation heatmap we can see that as expected all the rating metrics have strong positive correlation with the total rating except for the moisture. According to this, it is likely that higher moisture content results in lower coffee quality.
+
+```{r correlations}
+
+# Import library
+library(GGally)
+
+# Correlations
+ggcorr(df[, .SD, .SDcols =  c( "total_cup_points", rating_metrics)], hjust = .85, size = 3,layout.exp=2)
+
+```
+
+We can also take a look at the boxplots of the total rating by the categorical fields.
+
+```{r eda2}
+
+# Boxplots
+boxplots(df, df$species, df$total_cup_points, "Species", "Total cup points")
+boxplots(df, df$country_of_origin, df$total_cup_points, "Country of origin", "Total cup points") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+boxplots(df, df$variety_grouped, df$total_cup_points, "Variety", "Total cup points") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+boxplots(df, df$color, df$total_cup_points, "Color", "Total cup points")
+
+```
+
+As we saw earlier, the vast majority of the sample contains Arabica species hence we cannot really draw conclusions from comparing their boxplots. Regarding the split by countries farms that are located in Guatemala, Nicaragua, Mexico and Honduras have coffee ratings below 70. On the other hand, the one with the highest rating is also located in Guatemala.
+
+Now that we are finished with the primary exploration of our coffee dataset we can start to draw further insights from our data.
+
+### Dataviz
+
+#### Country of origination
+
+First, let's take a look at the main coffee producer countries by the number of ratings. Latin American countries hold the highest number of ratings where Mexico is leading with 250+ ratings. We can see that just a very few countries produce Robusta species which includes Uganda, India, Ecuador and the USA. Also there are 9 countries that have only one coffee rating (Ivory Coast, Mauritius, Zambia, Rwanda, Japan, Papua New Guinea).
+
+```{r, fig.align='center', fig.height=8, fig.width=8}
+
+df_country <- df[, .(count = .N) , by = .(country_of_origin, species)][order(-count)]
+df_country_rank <- df[, .(count_tot = .N) , by = .(country_of_origin)][order(-count_tot)][, rank := as.numeric(row.names(.SD))]
+df_country <- left_join(df_country, df_country_rank, by="country_of_origin")   
+
+ggplot( df_country , aes(x = reorder(country_of_origin, -rank), y = count, fill = species) ) +
+  geom_bar(stat = "identity" ) +
+  labs(title = 'Number of ratings by country and species', y = "Number of observations") +
+  scale_fill_manual("legend", values = c( "#238b45", "#2c7fb8")) +
+  coord_flip() +
+  theme_viki() +
+  theme(
+    axis.title.y = element_blank())
+
+rm(df_country)
+
+```
+
+#### Arabica - Robusta ratio
+
+Let's check the proportion of ratings of Robusta and Arabica species in the four countries that produce Robusta.
+
+```{r}
+
+robusta_countries <- df[species == "Robusta", .(count = .N), by =.(country_of_origin)][order(-count)]
+df_country <- df[country_of_origin %in% c(robusta_countries$country_of_origin), .(count = .N) , by = .(country_of_origin, species)][, count_robusta := ifelse(species == "Robusta", count, 0)]
+robusta_countries <- df_country[, count_country := sum(count), by = country_of_origin][, prop_robusta := count_robusta / count_country][order(country_of_origin)]
+
+ggplot( df_country , aes(x = reorder(country_of_origin, -prop_robusta), y = count, fill = species) ) +
+  geom_bar(stat = "identity", position = "fill") +
+  labs(title = 'Number of ratings by country and species') +
+  scale_fill_manual("legend", values = c( "#238b45", "#2c7fb8")) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_viki() +
+  theme(
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank())
+
+rm(robusta_countries, df_country)
+
+```
+
+India has ratings for only Robusta species, while in the USA their proportion is below 15%.
+
+#### Country ratings
+
+Now we can turn to the total ratings and rank the examined countries based on the distribution of their ratings. The next plot shows the top 10 countries with the highest number of ratings and highlights the owner company of the highest rated coffee.
+
+```{r, fig.align='center', fig.height=10, fig.width=8}
+
+# Create filter for countries with the most rating
+df[, count_country_ratings := sum(ifelse(!is.na(total_cup_points), 1, 0) ), by = country_of_origin][, .(country_of_origin, count_country_ratings, total_cup_points)]
+top_10_count_ratings <- df[, .(count = .N), by = .(country_of_origin, count_country_ratings)][order(-count_country_ratings)][, head(.SD, 15)]
+
+
+ggplot( df[country_of_origin %in% top_10_count_ratings$country_of_origin] , 
+        aes(y = reorder(country_of_origin, total_cup_points), x = total_cup_points, label = owner, fill = stat(x)) ) +
+  geom_density_ridges_gradient(scale= 0.9, show.legend = F, alpha = 0.5, point_alpha = 0.5, jittered_points = TRUE) +
+  labs(title = 'Top 10 countries based on the number of coffee ratings') +
+  scale_fill_viridis_c(alpha = 0.6) +
+  theme_viki() +
+    theme(
+    axis.title.y = element_blank(),
+    axis.title.x = element_blank(),
+    legend.position="none") +
+  geom_label_repel(
+    data = subset(df, total_cup_points > 89),
+    force = 10,
+    xlim = c(85, NA)) 
+
+
+```
+
+It seems that Ethiopia has the rating distribution closest to the highest scores. The 3 biggest producers, Mexico, Guatemala and Brazil are also among the top 10.
+
+#### Highest ratings by year
+
+Let's check that which county achieved the highest coffee rating in each year.
+
+```{r}
+
+df_yearly_max_rating <- df[!is.na(grading_date_year), .(max_total_cup_points = max(total_cup_points)), by = .(country_of_origin, grading_date_year)][order(grading_date_year, -max_total_cup_points)]
+df_yearly_max_rating <- df_yearly_max_rating[, first_by_year := rank( -max_total_cup_points), by = grading_date_year][first_by_year == 1]
+
+ggplot( df_yearly_max_rating , aes(y = max_total_cup_points, 
+                                   x = grading_date_year, 
+                                   fill = country_of_origin, 
+                                   color = country_of_origin, 
+                                   label=paste0(grading_date_year,"\n",country_of_origin,"\n", max_total_cup_points))) + 
+  geom_point() +
+  geom_text(position = position_dodge(width = 0.9),
+            hjust =-0.2,
+            size =3.5) +
+  ylim(c(80,95)) +
+  expand_limits(x= c(2009.5, 2018.5 )) +
+  scale_x_continuous(breaks = c(2010:2018)) +
+  labs(title = 'Countries with the highest ratings in each year', color = NULL, fill = NULL, label = NULL) +
+  ylab("Highest coffee rating") +
+  theme_viki() +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position="",
+    panel.grid.minor = element_blank()
+    )
+  
+```
+
+It seems that there is a lot of variation in the leading countries.
+
+#### Coffee growing altitude by countries
+
+We can also investigate the relationship between the coffee ratings and the growing altitude. For this first let's plot the distribution of the growing altitude by each producing countries.
+
+```{r, fig.align='center', fig.height=8, fig.width=8}
+
+ggplot( df, aes(x=reorder(country_of_origin, -altitude_mean_meters), y=altitude_mean_meters, fill=country_of_origin)) +
+  geom_boxplot() +
+  geom_jitter(color="grey", alpha=0.3, size=0.9) +
+  scale_fill_viridis_d() +
+  xlab("") +
+  ylab("Growing altitude (meters)") +
+  labs(title = 'Countries ranked by growing altitude', color = NULL, fill = NULL, label = NULL) +
+  coord_flip() +
+  theme_viki() +
+  theme(
+    legend.position="none") 
+
+```
+
+Note that altitude information was missing for 17% of the observations which puts a limitation to our findings. Among the countries with the highest growing altitude we can find Ethiopia, Papua New Guinea, Guatemala and Kenya implied by the external coffee statistics.
+
+#### Altitude and total cup points
+
+The next scatter plot shows the relationship between the growing altitude and the coffee ratings separately for each continent.
+
+```{r}
+
+library(gganimate)
+
+ggplot( df , aes(x = altitude_mean_meters, 
+                 y = total_cup_points, 
+                 color = continent_of_origin)) + 
+  geom_point( alpha = 0.8, size = 1) +
+  geom_smooth(method = "lm", se = F) +
+  transition_states(continent_of_origin, transition_length = 10, state_length = 10) +
+  scale_color_viridis_d(begin = 0, end = 0.9)+
+  ylab("Coffee rating") +
+  xlab("Coffee growing altitude (meters)") +
+  labs(title = 'Relationship between altitude and coffee ratings',
+    subtitle = '{closest_state}') +
+  theme_viki() +
+  theme(
+    legend.position="none")
+
+
+  
+```
+
+It seems that farms located at higher altitudes produce higher rated coffee. This positive pattern holds for each continent.
+
+#### Country ranking by different coffee rating measures
+
+As the final score is calculated by the 11 individual rating categories we can expect that some countries perform better in one rating dimension while others achieve higher ratings in another categories. The next animation shows the countries ranked by their mean ratings in each rating category together with their score ranges.
+
+```{r}
+
+
+library(stringr)
+
+# Create long dataset
+df_long <- melt(df[, .SD, .SDcols =  c("ID", "country_of_origin", rating_metrics)], id.vars = c("ID", "country_of_origin"),
+                measure.vars = rating_metrics)
+
+# Create aggregates - Country level
+county_aggregates <- df_long[, .(max_value = max(value, na.rm = T), 
+                                 min_value = min(value, na.rm = T), 
+                                 mean_value = mean(value, na.rm = T),
+                                 rating_number = .N), by = .(country_of_origin, variable)][order(variable, -mean_value, - rating_number, country_of_origin)][, rank := as.numeric(row.names(.SD)), by = variable]
+
+# Create aggregates - Total
+total_aggregates <- df_long[, .(max_value_total = max(value, na.rm = T), min_value_total = min(value, na.rm = T), mean_value_total = mean(value, na.rm = T)), by = .(variable)]
+
+# Join datasets
+county_aggregates <- left_join(x = county_aggregates, y = total_aggregates, by =c("variable"))
+
+
+p <- ggplot(county_aggregates, aes(y= -rank)) +
+  transition_states(variable, transition_length = 10, state_length = 10) +
+  geom_text(aes(x = -3, label = country_of_origin), hjust = -0.01, size = 6) +
+  geom_point(aes(x = mean_value, y = -rank, color=country_of_origin), alpha = 0.8 , size = 3) +
+  geom_segment(aes(x = 0, y = -rank, xend = 10, yend = -rank),alpha = 0.4, size = 0.5) +
+  geom_segment(aes(x = min_value, y = -rank, xend = max_value, yend = -rank, color=country_of_origin),alpha = 0.7, size = 1.5) +
+  geom_vline(aes(xintercept = mean_value_total), color = "red", size = 1) +
+  scale_x_continuous(breaks = c(0:10)) +
+  scale_y_continuous(seq(from = 0, to = 36, by = 1)) +
+  scale_color_viridis_d() +
+  xlab("Rating")+
+  expand_limits(x= c(-3, 10)) +
+  labs(
+    title = 'Countries ranked by different coffee rating metrics', 
+    subtitle = '{str_to_title(closest_state)}') +
+  theme_viki() +
+  theme(
+    axis.title.y = element_blank(),
+    axis.ticks.y=element_blank(),
+    axis.text.y=element_blank(),
+    axis.text.x=element_text(size=18),
+    axis.title.x = element_text(size=18),
+    legend.position="none",
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(size=22),
+    plot.subtitle = element_text(size=14)
+    )
+
+animate(p, nframes = 100, fps=5, height = 1000, width =800)
+anim_save("p.gif")
+
+```
+
+We can see that for example with the aroma and sweetness ratings Tanzania is the leader, while in case of the flavor dimension Papua New Guinea ranks first.
+
+#### Average ratings
+
+The next graph colors the coffee producer countries by their average rating.
+
+```{r}
+
+library(rworldmap)
+library(RColorBrewer)
+
+df_country_species <- df[, .(mean_rating = mean(total_cup_points)), by = .(country_of_origin, species)]
+# map_world$filter <- ifelse(map_world$region %in% df_country_species$country_of_origin, map_world$region, NA)
+
+# Create a map-shaped window
+mapDevice('x11')
+
+# Join dataset
+spdf <- joinCountryData2Map(df_country_species, joinCode="NAME", nameJoinColumn="country_of_origin")
+
+mapCountryData(spdf, 
+               nameColumnToPlot="mean_rating", 
+               catMethod="fixedWidth",
+               mapTitle = "Mean coffee ratings",
+               missingCountryCol = 'grey')
+
+
+```
+
+Mexico is surely the leader on the American continent while in Africa Ethiopia has the highest average coffee ranking. As we saw earlier Ethiopia is the leader not just in its continent but it produces the highest rated coffee among the producers.
+
+If we go back to our initial question that where should we travel if we would like to drink the world's best coffee then the answer is definitely Ethiopia. The next chart shows the top 3 regions in Ethiopia with the highest average coffee ratings using a downloaded custom map of the country.
+
+```{r}
+
+# Filter top regions
+df_aggr <- df[country_of_origin == "Ethiopia", .(max_total = max(total_cup_points)), by = .(region)][order(-max_total)]
+
+# Remote file information
+u_remote <- "https://biogeo.ucdavis.edu/"
+p_remote <- "data/gadm3.6/Rsf/"
+f_name <- "gadm36_ETH_3_sf.rds"
+
+# Local file location to save to
+ethiopia_rds <- file.path(tempdir(), "gadm36_ETH_3_sf.rds")
+
+if (toupper(Sys.info()["sysname"]) == "WINDOWS") {
+  download.file(
+    url = paste0(u_remote, p_remote, f_name),
+    destfile = ethiopia_rds,
+    method = "wininet",
+    mode = "wb"
+  )
+} else {
+  download.file(
+    url = paste0(u_remote, p_remote, f_name),
+    destfile = ethiopia_rds,
+    method = "auto"
+  )
+}
+
+# GADM distributes native R files in .rds format that we then import.
+ethiopia_sf <- readRDS(ethiopia_rds)
+
+# Using geom_sf_text() we can add labels to the map.
+ethiopia_regions_sf <-
+  ethiopia_sf %>%
+  mutate(NAME_1 = gsub("SNNP", "Oromia",
+                       NAME_1)) %>%
+  group_by(NAME_1) %>%
+  summarise() %>%
+  ungroup() %>%
+  st_as_sf()
+
+# First layer, country outline
+ethiopia_simple_sf <-
+  ethiopia_sf %>%
+  group_by(NAME_0) %>%
+  summarise() %>%
+  ungroup() %>%
+  st_as_sf()
+
+# Second layer
+ethiopia_zones_sf <- 
+  ethiopia_sf %>%
+  filter(
+    NAME_2 %in% c(
+      "Guji",
+      "Keffa",
+      "Oromia"
+    )
+  )
+
+ # Final map
+final_map <- ggplot() +
+  geom_sf(data = ethiopia_simple_sf,
+          col = NA,
+          fill = "#D5C1AB") + # use a coffee-ish colour background for country
+  geom_sf(data = ethiopia_zones_sf, # add zones and fill by name
+          aes(fill = NAME_2),
+          colour = NA) 
+
+final_map <- 
+  final_map +
+  labs(
+    x = "Longitude",
+    y = "Latitude",
+    title = "Ethiopian top coffee regions",
+    caption = "Data from GADM, https://gadm.org",
+    fill = "Zone",
+    linetype = "Region"
+  ) + theme_bw() +
+  theme(panel.grid.major = element_line(colour = "transparent"),
+        axis.title.y = element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.text.x=element_blank(),
+        axis.title.x = element_blank())
+
+final_map
+
+```
+
+### Summary
+
+We have seen that there is a lot of heterogeneity in the rating of the coffee products between producer countries . Ethiopia was ranked first not just in the overall ratings but it was the leader in the aftertaste rating category as well. The dominant coffee variety is Arabica only India is specialized in the cultivation of Robusta species. External studies implied that we can expect variation in the coffee quality by the growing altitude. When we examined the relationship between the growing altitude and the positive association was clearly visible even wen we examined the relationship by continents. Finally, if one would like to drink a good cup of coffee my recommendation is the Ethiopian variant.
